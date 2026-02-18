@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Discord市況レポートBot
-毎朝、日本株・米国株・為替・商品の市況とAI分析をDiscordに投稿する
+毎朝、日本株・米国株・為替の市況とAI分析をDiscordに投稿する
 """
 
 import os
 import sys
-from datetime import datetime
-from typing import Optional, Dict, List
+from datetime import datetime, timedelta
+from typing import Optional, Dict
 
 try:
     from zoneinfo import ZoneInfo
@@ -20,36 +20,31 @@ from openai import OpenAI
 
 
 JST = ZoneInfo("Asia/Tokyo")
+UTC = ZoneInfo("UTC")
 
 MARKET_DATA = {
     "japan": {
         "title": "日本市場",
+        "emoji": "🇯🇵",
         "symbols": {
             "^N225": "日経平均",
-            "1306.T": "TOPIX連動",
+            "1306.T": "TOPIX",
         }
     },
     "us": {
-        "title": "米国市場（前日終値）",
+        "title": "米国市場（前日）",
+        "emoji": "🇺🇸",
         "symbols": {
             "^GSPC": "S&P 500",
             "^IXIC": "NASDAQ",
-            "^DJI": "ダウ平均",
+            "^DJI": "ダウ",
         }
     },
     "fx": {
         "title": "為替",
+        "emoji": "💱",
         "symbols": {
             "USDJPY=X": "ドル円",
-        }
-    },
-    "indicators": {
-        "title": "指標・商品",
-        "symbols": {
-            "^VIX": "VIX",
-            "GC=F": "金",
-            "CL=F": "原油",
-            "^SOX": "SOX",
         }
     },
 }
@@ -62,135 +57,190 @@ def is_weekday() -> bool:
 
 
 def get_stock_data(symbol: str) -> Optional[dict]:
-    """指定シンボルの株価データを取得"""
-    try:
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="5d")
-        
-        if len(hist) < 1:
-            return None
-        
-        latest = hist.iloc[-1]
-        prev = hist.iloc[-2] if len(hist) >= 2 else latest
-        
-        price = latest["Close"]
-        prev_close = prev["Close"]
-        change = price - prev_close
-        change_pct = (change / prev_close) * 100 if prev_close != 0 else 0
-        
-        return {
-            "price": price,
-            "prev_close": prev_close,
-            "change": change,
-            "change_pct": change_pct,
-        }
-    except Exception as e:
-        print(f"Error fetching {symbol}: {e}", file=sys.stderr)
-        return None
+    """指定シンボルの株価データを取得（複数回リトライ）"""
+    for attempt in range(3):
+        try:
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period="5d", interval="1d")
+            
+            if hist.empty or len(hist) < 2:
+                print(f"Warning: Insufficient data for {symbol}, attempt {attempt + 1}", file=sys.stderr)
+                continue
+            
+            hist = hist.dropna()
+            if len(hist) < 2:
+                continue
+            
+            latest = hist.iloc[-1]
+            prev = hist.iloc[-2]
+            
+            price = float(latest["Close"])
+            prev_close = float(prev["Close"])
+            
+            if price <= 0 or prev_close <= 0:
+                print(f"Warning: Invalid price for {symbol}", file=sys.stderr)
+                continue
+            
+            change = price - prev_close
+            change_pct = (change / prev_close) * 100
+            
+            latest_date = hist.index[-1]
+            if hasattr(latest_date, 'tz_localize'):
+                latest_date = latest_date.tz_localize(UTC)
+            
+            return {
+                "price": price,
+                "prev_close": prev_close,
+                "change": change,
+                "change_pct": change_pct,
+                "date": latest_date,
+                "verified": True,
+            }
+        except Exception as e:
+            print(f"Error fetching {symbol} (attempt {attempt + 1}): {e}", file=sys.stderr)
+            continue
+    
+    return None
 
 
-def fetch_all_market_data() -> Dict[str, Dict[str, dict]]:
+def fetch_all_market_data() -> Dict[str, Dict]:
     """全市場データを取得"""
     results = {}
+    errors = []
     
     for category, config in MARKET_DATA.items():
         results[category] = {
             "title": config["title"],
+            "emoji": config["emoji"],
             "data": {}
         }
         for symbol, name in config["symbols"].items():
             data = get_stock_data(symbol)
-            if data:
+            if data and data.get("verified"):
                 results[category]["data"][name] = data
+            else:
+                errors.append(f"{name}({symbol})")
+    
+    if errors:
+        print(f"Failed to fetch: {', '.join(errors)}", file=sys.stderr)
     
     return results
 
 
-def format_market_section(title: str, data: Dict[str, dict]) -> str:
-    """市場セクションをフォーマット"""
-    if not data:
-        return ""
-    
-    lines = [f"**【{title}】**"]
-    
-    for name, values in data.items():
-        sign = "+" if values["change"] >= 0 else ""
-        
-        if "ドル円" in name:
-            price_fmt = f"{values['price']:.2f}"
-        elif values["price"] >= 1000:
-            price_fmt = f"{values['price']:,.0f}"
-        else:
-            price_fmt = f"{values['price']:,.2f}"
-        
-        lines.append(f"  {name}: {price_fmt} ({sign}{values['change_pct']:.2f}%)")
-    
-    return "\n".join(lines)
+def format_price(price: float, name: str) -> str:
+    """価格をフォーマット"""
+    if "ドル円" in name:
+        return f"{price:.2f} 円"
+    elif price >= 10000:
+        return f"{price:,.0f}"
+    elif price >= 100:
+        return f"{price:,.0f}"
+    else:
+        return f"{price:,.2f}"
 
 
-def generate_ai_analysis(market_data: Dict[str, Dict[str, dict]], openai_key: str) -> str:
+def get_trend_emoji(change_pct: float) -> str:
+    """変動率に応じた絵文字"""
+    if change_pct >= 1.0:
+        return "🚀"
+    elif change_pct >= 0.3:
+        return "📈"
+    elif change_pct > -0.3:
+        return "➡️"
+    elif change_pct > -1.0:
+        return "📉"
+    else:
+        return "⚠️"
+
+
+def generate_ai_analysis(market_data: Dict[str, Dict], openai_key: str) -> str:
     """OpenAI GPTで市況分析を生成"""
     try:
         client = OpenAI(api_key=openai_key)
         
-        data_summary = []
+        data_lines = []
         for category, info in market_data.items():
             for name, values in info["data"].items():
                 sign = "+" if values["change_pct"] >= 0 else ""
-                data_summary.append(f"{name}: {sign}{values['change_pct']:.2f}%")
+                data_lines.append(f"- {name}: {values['price']:.2f} ({sign}{values['change_pct']:.2f}%)")
         
-        data_text = "\n".join(data_summary)
+        data_text = "\n".join(data_lines)
+        now = datetime.now(JST)
+        weekday_jp = ["月", "火", "水", "木", "金", "土", "日"][now.weekday()]
         
-        prompt = f"""あなたは専業投資家として、以下の市況データを分析し、簡潔な一言コメントを5行程度で作成してください。
+        prompt = f"""あなたは経験豊富な専業投資家です。以下の市況データを分析し、今日のポイントを作成してください。
 
-【本日の市況データ】
+【本日】{now.strftime('%Y年%m月%d日')}（{weekday_jp}）
+
+【市況データ】
 {data_text}
 
 【出力ルール】
-- 専業投資家・トレーダー目線で分析
-- 各市場の動向と相関関係を簡潔に解説
-- 本日注目すべきポイントを1〜2点挙げる
-- 絵文字は使わない
-- 5行以内で簡潔に"""
+1. 3〜4行で簡潔にまとめる
+2. 数値データに基づいた客観的な分析のみ
+3. 「〜が予想されます」「〜かもしれません」など推測は控えめに
+4. 初心者にもわかりやすい表現を使う
+5. 絵文字は使わない
+6. 最後に「🎯 注目：」で今日注目すべき1点を挙げる
+
+【禁止事項】
+- 具体的な銘柄の推奨
+- 売買の指示
+- 根拠のない予測"""
 
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "あなたは経験豊富な専業投資家です。市況を簡潔かつ的確に分析します。"},
+                {"role": "system", "content": "あなたは日本株投資コミュニティ向けに毎朝の市況解説を担当する専業投資家です。初心者から上級者まで参考になる、正確で簡潔な分析を提供します。"},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=300,
-            temperature=0.7,
+            max_tokens=400,
+            temperature=0.5,
         )
         
         return response.choices[0].message.content.strip()
     
     except Exception as e:
         print(f"Error generating AI analysis: {e}", file=sys.stderr)
-        return "AI分析を生成できませんでした。"
+        return "本日の分析を生成できませんでした。"
 
 
-def format_message(market_data: Dict[str, Dict[str, dict]], ai_analysis: str) -> str:
+def format_message(market_data: Dict[str, Dict], ai_analysis: str) -> str:
     """Discord投稿用のメッセージをフォーマット"""
     now = datetime.now(JST)
-    date_str = now.strftime("%Y/%m/%d %H:%M")
+    weekday_jp = ["月", "火", "水", "木", "金", "土", "日"][now.weekday()]
+    date_str = now.strftime(f"%m月%d日（{weekday_jp}）")
     
-    lines = [f"📈 **本日の市況レポート**（{date_str} JST）\n"]
+    lines = [
+        "☀️ おはようございます！",
+        f"📊 **{date_str}の市況レポート**",
+        "",
+        "━━━━━━━━━━━━━━━━",
+    ]
     
-    for category in ["japan", "us", "fx", "indicators"]:
-        if category in market_data:
-            section = format_market_section(
-                market_data[category]["title"],
-                market_data[category]["data"]
-            )
-            if section:
-                lines.append(section)
-                lines.append("")
+    for category in ["japan", "us", "fx"]:
+        if category not in market_data or not market_data[category]["data"]:
+            continue
+        
+        info = market_data[category]
+        lines.append("")
+        lines.append(f"{info['emoji']} **{info['title']}**")
+        
+        for name, values in info["data"].items():
+            price_str = format_price(values["price"], name)
+            sign = "+" if values["change_pct"] >= 0 else ""
+            trend = get_trend_emoji(values["change_pct"])
+            lines.append(f"┃ {name}　{price_str}（{sign}{values['change_pct']:.2f}%）{trend}")
     
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("💡 **専業投資家の視点**\n")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━")
+    lines.append("")
+    lines.append("💡 **今日のポイント**")
+    lines.append("")
     lines.append(ai_analysis)
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━")
+    lines.append("良い一日を！🍀")
     
     return "\n".join(lines)
 
@@ -225,6 +275,13 @@ def main():
     
     print("Fetching market data...")
     market_data = fetch_all_market_data()
+    
+    total_items = sum(len(info["data"]) for info in market_data.values())
+    if total_items == 0:
+        print("Error: No market data could be fetched", file=sys.stderr)
+        sys.exit(1)
+    
+    print(f"Successfully fetched {total_items} items")
     
     print("Generating AI analysis...")
     ai_analysis = generate_ai_analysis(market_data, openai_key)
