@@ -84,16 +84,11 @@ def get_stock_data(symbol: str) -> Optional[dict]:
             change = price - prev_close
             change_pct = (change / prev_close) * 100
             
-            latest_date = hist.index[-1]
-            if hasattr(latest_date, 'tz_localize'):
-                latest_date = latest_date.tz_localize(UTC)
-            
             return {
                 "price": price,
                 "prev_close": prev_close,
                 "change": change,
                 "change_pct": change_pct,
-                "date": latest_date,
                 "verified": True,
             }
         except Exception as e:
